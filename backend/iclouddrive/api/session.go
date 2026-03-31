@@ -354,7 +354,7 @@ func (s *Session) authSRPComplete(ctx context.Context, accountName, m1Base64, m2
 // getAuthOrigin returns the origin URL for auth requests.
 // Supports both global (idmsa.apple.com) and China (idmsa.apple.com.cn) endpoints.
 func getAuthOrigin() string {
-   return strings.TrimSuffix(authEndpoint, "/appleauth/auth")
+	return strings.TrimSuffix(authEndpoint, "/appleauth/auth")
 }
 
 // getSRPAuthHeaders returns headers needed for SRP auth requests.
