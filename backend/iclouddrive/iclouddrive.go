@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"path"
+	"strconv"
 
 	"errors"
 	"fmt"
@@ -43,6 +44,14 @@ const (
 	configClientID   = "client_id"
 	configCookies    = "cookies"
 	configTrustToken = "trust_token"
+
+	// Temporary config keys for preserving session across Config() calls
+	configSessionID     = "session_id"
+	configScnt          = "scnt"
+	configAuthAttrs     = "auth_attributes"
+	configFrameID       = "frame_id"
+	configSessionToken  = "session_token"
+	configSMSPhoneID    = "sms_phone_id"
 
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
@@ -169,6 +178,13 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 		}
 		m.Set(configCookies, icloud.Session.GetCookieString())
 		if icloud.Session.Requires2FA() {
+			// Save session state so 2fa_do can validate without re-authenticating
+			m.Set(configSessionID, icloud.Session.SessionID)
+			m.Set(configScnt, icloud.Session.Scnt)
+			m.Set(configAuthAttrs, icloud.Session.AuthAttributes)
+			m.Set(configFrameID, icloud.Session.FrameID)
+			m.Set(configSessionToken, icloud.Session.SessionToken)
+			m.Set(configSMSPhoneID, strconv.Itoa(icloud.Session.SMSPhoneID))
 			return fs.ConfigInput("2fa_do", "config_2fa", "Two-factor authentication: please enter your 2FA code")
 		}
 		return nil, nil
@@ -178,13 +194,25 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 			return fs.ConfigError("authenticate", "2FA codes can't be blank")
 		}
 
+		// Restore session state from the first call instead of re-authenticating
 		icloud, err := api.New(appleid, password, trustToken, clientID, cookies, nil)
 		if err != nil {
 			return nil, err
 		}
-		if err := icloud.SignIn(ctx); err != nil {
-			return nil, err
-		}
+		sessionID, _ := m.Get(configSessionID)
+		scnt, _ := m.Get(configScnt)
+		authAttrs, _ := m.Get(configAuthAttrs)
+		frameID, _ := m.Get(configFrameID)
+		sessionToken, _ := m.Get(configSessionToken)
+		smsPhoneIDStr, _ := m.Get(configSMSPhoneID)
+		smsPhoneID, _ := strconv.Atoi(smsPhoneIDStr)
+
+		icloud.Session.SessionID = sessionID
+		icloud.Session.Scnt = scnt
+		icloud.Session.AuthAttributes = authAttrs
+		icloud.Session.FrameID = frameID
+		icloud.Session.SessionToken = sessionToken
+		icloud.Session.SMSPhoneID = smsPhoneID
 
 		if err := icloud.Session.Validate2FACode(ctx, code); err != nil {
 			return nil, err
@@ -192,6 +220,14 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 
 		m.Set(configTrustToken, icloud.Session.TrustToken)
 		m.Set(configCookies, icloud.Session.GetCookieString())
+
+		// Clean up temporary session state
+		m.Set(configSessionID, "")
+		m.Set(configScnt, "")
+		m.Set(configAuthAttrs, "")
+		m.Set(configFrameID, "")
+		m.Set(configSessionToken, "")
+		m.Set(configSMSPhoneID, "")
 		return nil, nil
 
 	case "2fa_error":

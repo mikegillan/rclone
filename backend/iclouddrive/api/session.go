@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -32,8 +34,9 @@ type Session struct {
 	Cookies        []*http.Cookie `json:"cookies"`
 	AccountInfo    AccountInfo    `json:"account_info"`
 
-	srv      *rest.Client `json:"-"`
-	needs2FA bool         `json:"-"` // set when SRP signin returns 409
+	srv        *rest.Client `json:"-"`
+	needs2FA   bool         `json:"-"` // set when SRP signin returns 409
+	SMSPhoneID int          `json:"-"` // set when SMS was requested; 0 = trusted device flow
 }
 
 // srpInitResponse is the server response from /auth/signin/init
@@ -343,12 +346,115 @@ func (s *Session) authSRPComplete(ctx context.Context, accountName, m1Base64, m2
 		// 409 = 2FA required, this is expected
 		fs.Debugf("icloud", "SRP sign in requires 2FA")
 		s.needs2FA = true
+		// Request auth options to trigger Apple to push the 2FA code
+		// to trusted devices. Without this call, the code is never sent.
+		if err := s.requestAuthOptions(ctx); err != nil {
+			fs.Debugf("icloud", "requestAuthOptions failed (non-fatal): %v", err)
+		}
 		return nil
 	case http.StatusForbidden:
 		return fmt.Errorf("sign in failed: incorrect username or password")
 	default:
 		return fmt.Errorf("sign in failed: %s", resp.Status)
 	}
+}
+
+// authOptionsResponse is the response from GET /appleauth/auth after 409.
+type authOptionsResponse struct {
+	PhoneNumberVerification *struct {
+		TrustedPhoneNumbers []struct {
+			ID                 int    `json:"id"`
+			NumberWithDialCode string `json:"numberWithDialCode"`
+			PushMode           string `json:"pushMode"`
+		} `json:"trustedPhoneNumbers"`
+		NoTrustedDevices bool `json:"noTrustedDevices"`
+		SecurityCode     *struct {
+			Length int `json:"length"`
+		} `json:"securityCode"`
+	} `json:"phoneNumberVerification"`
+}
+
+// requestAuthOptions makes a GET to /appleauth/auth after SRP signin returns 409.
+// This fetches auth options and triggers Apple to push the 2FA code.
+// If push delivery fails or there are no trusted devices, requests SMS.
+func (s *Session) requestAuthOptions(ctx context.Context) error {
+	opts := rest.Opts{
+		Method:       "GET",
+		RootURL:      authEndpoint,
+		ExtraHeaders: s.getSRPAuthHeaders(),
+	}
+
+	resp, err := s.srv.Call(ctx, &opts)
+	if err != nil {
+		return err
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("requestAuthOptions: read body: %w", err)
+	}
+
+	if val := resp.Header.Get("scnt"); val != "" {
+		s.Scnt = val
+	}
+	if val := resp.Header.Get("X-Apple-ID-Session-Id"); val != "" {
+		s.SessionID = val
+	}
+
+	fs.Debugf("icloud", "requestAuthOptions: status %s", resp.Status)
+
+	var authOpts authOptionsResponse
+	if err := json.Unmarshal(body, &authOpts); err != nil {
+		fs.Debugf("icloud", "requestAuthOptions: failed to parse response: %v", err)
+		return nil
+	}
+
+	pv := authOpts.PhoneNumberVerification
+	if pv == nil {
+		fs.Debugf("icloud", "requestAuthOptions: no phoneNumberVerification in response")
+		return nil
+	}
+
+	fs.Debugf("icloud", "requestAuthOptions: noTrustedDevices=%v, trustedPhones=%d",
+		pv.NoTrustedDevices, len(pv.TrustedPhoneNumbers))
+
+	// Always request SMS to the first phone — push notifications to
+	// trusted devices are unreliable from non-Apple clients.
+	if len(pv.TrustedPhoneNumbers) > 0 {
+		phone := pv.TrustedPhoneNumbers[0]
+		fs.Logf("icloud", "Requesting SMS code to %s", phone.NumberWithDialCode)
+		if err := s.requestSMSCode(ctx, phone.ID); err != nil {
+			fs.Debugf("icloud", "requestSMSCode failed: %v", err)
+		} else {
+			s.SMSPhoneID = phone.ID
+		}
+	}
+
+	return nil
+}
+
+// requestSMSCode requests Apple to send an SMS security code to a trusted phone.
+func (s *Session) requestSMSCode(ctx context.Context, phoneID int) error {
+	values := map[string]any{
+		"phoneNumber": map[string]any{"id": phoneID},
+		"mode":        "sms",
+	}
+	body, err := IntoReader(values)
+	if err != nil {
+		return err
+	}
+
+	opts := rest.Opts{
+		Method:       "PUT",
+		Path:         "/verify/phone",
+		RootURL:      authEndpoint,
+		ExtraHeaders: s.getSRPAuthHeaders(),
+		Body:         body,
+		NoResponse:   true,
+	}
+
+	_, err = s.srv.Call(ctx, &opts)
+	return err
 }
 
 // getAuthOrigin returns the origin URL for auth requests.
@@ -423,7 +529,25 @@ func (s *Session) AuthWithToken(ctx context.Context) error {
 
 // Validate2FACode validates the 2FA code
 func (s *Session) Validate2FACode(ctx context.Context, code string) error {
-	values := map[string]any{"securityCode": map[string]string{"code": code}}
+	var values map[string]any
+	var path string
+
+	if s.SMSPhoneID != 0 {
+		// SMS flow: POST /verify/phone/securitycode
+		path = "/verify/phone/securitycode"
+		values = map[string]any{
+			"securityCode": map[string]string{"code": code},
+			"phoneNumber":  map[string]int{"id": s.SMSPhoneID},
+			"mode":         "sms",
+		}
+	} else {
+		// Trusted device flow: POST /verify/trusteddevice/securitycode
+		path = "/verify/trusteddevice/securitycode"
+		values = map[string]any{
+			"securityCode": map[string]string{"code": code},
+		}
+	}
+
 	body, err := IntoReader(values)
 	if err != nil {
 		return err
@@ -431,7 +555,7 @@ func (s *Session) Validate2FACode(ctx context.Context, code string) error {
 
 	opts := rest.Opts{
 		Method:       "POST",
-		Path:         "/verify/trusteddevice/securitycode",
+		Path:         path,
 		ExtraHeaders: s.GetAuthHeaders(map[string]string{}),
 		RootURL:      authEndpoint,
 		Body:         body,
